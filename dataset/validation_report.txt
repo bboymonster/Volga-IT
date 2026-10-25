@@ -1,0 +1,33 @@
+============================================================
+     DATASET VALIDATION REPORT (Volga-IT semi-final)
+============================================================
+Dataset root: C:\Projects\Volga-IT\dataset
+Status: PASSED
+Errors count: 0
+Warnings count: 0
+------------------------------------------------------------
+STATISTICS:
+  Total records in meta.csv: 5350
+  Valid records:             5350
+  Real images:               350
+  Synthetic images:          5000
+  Total images:              5350
+  Vehicles (is_vehicle=1):   5093
+  Non-vehicles (is_veh=0):   257
+
+Plates breakdown by type:
+  - type1   :   1023 plates (  1023 unique)
+  - type1a  :   2168 plates (  2168 unique)
+  - type1b  :   1545 plates (  1545 unique)
+  - other   :    614 plates (   369 unique)
+
+Conditions breakdown:
+  - day         :   3604
+  - rain        :   1038
+  - dirt        :   1617
+  - night       :   1746
+  - angle       :   3653
+  - motion_blur :    983
+  - snow        :    786
+  - glare       :   1366
+============================================================

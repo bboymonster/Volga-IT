@@ -1,0 +1,8 @@
+path: c:/Projects/Volga-IT/dataset
+train: images/synthetic
+val: images/real
+names:
+  0: type1
+  1: type1a
+  2: type1b
+  3: other
