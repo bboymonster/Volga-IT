@@ -22,12 +22,12 @@ Plates breakdown by type:
   - other   :    614 plates (   369 unique)
 
 Conditions breakdown:
-  - day         :   3604
-  - rain        :   1038
-  - dirt        :   1617
-  - night       :   1746
-  - angle       :   3653
   - motion_blur :    983
-  - snow        :    786
   - glare       :   1366
+  - day         :   3604
+  - angle       :   3653
+  - snow        :    786
+  - dirt        :   1617
+  - rain        :   1038
+  - night       :   1746
 ============================================================

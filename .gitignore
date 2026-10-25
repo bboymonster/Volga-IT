@@ -30,3 +30,5 @@ results.csv
 
 # Large documents
 *.pdf
+!EXPLANATORY_NOTE.pdf
+

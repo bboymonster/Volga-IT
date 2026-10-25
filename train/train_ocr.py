@@ -2,89 +2,214 @@
 """
 Training script for License Plate OCR (CRNN with CTC Loss).
 Optimized for Russian plates: single-line (type1, type1b) and dual-line (type1a).
-Trains with online synthetic augmentation and saves best weights to models/ocr_best.pt.
+Combines real road dataset crops with multi-font domain-randomized synthetic generation.
+Saves best weights to models/ocr_best.pt.
 """
 
 import os
 import sys
 import random
 import argparse
+import glob
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+import pandas as pd
 import cv2
+from PIL import Image, ImageDraw, ImageFont
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
-from src.config import VOCABULARY, CHAR_TO_IDX, IDX_TO_CHAR
+from src.config import VOCABULARY, CHAR_TO_IDX, IDX_TO_CHAR, ALLOWED_LETTERS, ALLOWED_DIGITS
 from src.ocr import CRNN
-from dataset.generator.generate_synthetic import generate_plate_image, LETTERS, DIGITS, ALL_REGIONS
-from src.preprocessor import split_type1a_lines, enhance_plate
+from dataset.generator.generate_synthetic import LETTERS, DIGITS, ALL_REGIONS, draw_russian_flag
+from src.preprocessor import split_type1a_lines, rectify_plate
+
+# Available fonts on Windows
+FONTS = [
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/tahomabd.ttf",
+    "C:/Windows/Fonts/tahoma.ttf",
+    "C:/Windows/Fonts/verdanab.ttf",
+    "C:/Windows/Fonts/verdana.ttf",
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+]
+VALID_FONTS = [f for f in FONTS if os.path.exists(f)]
+if not VALID_FONTS:
+    VALID_FONTS = ["arial.ttf"]
+
+
+def generate_synthetic_line(mode: str, font_path: str = None) -> Tuple[np.ndarray, str]:
+    """
+    Generate synthetic single-line image for OCR training:
+    - 'full_type1': single-line white plate (A123BC77)
+    - 'full_type1b': single-line yellow plate (A123BC77)
+    - 'type1a_top': upper line of type1a (A123 + flag/RUS)
+    - 'type1a_bot': lower line of type1a (BC77)
+    """
+    if font_path is None or not os.path.exists(font_path):
+        font_path = random.choice(VALID_FONTS)
+
+    w, h = 256, 48
+    bg_color = (245, 195, 25) if mode == 'full_type1b' else (random.randint(235, 250), random.randint(235, 250), random.randint(235, 250))
+    img = Image.new("RGB", (w, h), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    text_color = (random.randint(10, 30), random.randint(10, 30), random.randint(10, 30))
+
+    if mode in ('full_type1', 'full_type1b'):
+        l1 = random.choice(LETTERS)
+        d3 = "".join(random.choices(DIGITS, k=3))
+        l2 = "".join(random.choices(LETTERS, k=2))
+        reg = random.choice(ALL_REGIONS)
+        text = f"{l1}{d3}{l2}{reg}"
+
+        f_size = random.randint(30, 36)
+        font = ImageFont.truetype(font_path, size=f_size)
+        start_x = random.randint(8, 16)
+        y = random.randint(2, 8)
+        
+        # Draw series
+        full_str = f"{l1} {d3} {l2}  {reg}"
+        draw.text((start_x, y), full_str, fill=text_color, font=font)
+
+    elif mode == 'type1a_top':
+        l1 = random.choice(LETTERS)
+        d3 = "".join(random.choices(DIGITS, k=3))
+        text = f"{l1}{d3}"
+
+        f_size = random.randint(32, 38)
+        font = ImageFont.truetype(font_path, size=f_size)
+        start_x = random.randint(12, 25)
+        y = random.randint(2, 6)
+
+        # Draw L DDD
+        draw.text((start_x, y), f"{l1} {d3}", fill=text_color, font=font)
+
+        # Sometimes draw flag and RUS on the right
+        if random.random() < 0.8:
+            flag_x = random.randint(185, 205)
+            flag_y = random.randint(6, 12)
+            draw_russian_flag(draw, flag_x, flag_y, 35, 18)
+            rus_font = ImageFont.truetype(font_path, size=10)
+            draw.text((flag_x + 5, flag_y + 20), "RUS", fill=text_color, font=rus_font)
+
+    else:  # type1a_bot
+        l2 = "".join(random.choices(LETTERS, k=2))
+        reg = random.choice(ALL_REGIONS)
+        text = f"{l2}{reg}"
+
+        f_size = random.randint(32, 38)
+        font = ImageFont.truetype(font_path, size=f_size)
+        start_x = random.randint(15, 30)
+        y = random.randint(2, 6)
+
+        draw.text((start_x, y), l2, fill=text_color, font=font)
+        reg_x = random.randint(120, 160)
+        draw.text((reg_x, y), reg, fill=text_color, font=font)
+
+    crop_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    return crop_bgr, text
 
 
 class LicensePlateOCRDataset(Dataset):
     """
-    Dynamic OCR dataset generating realistic license plate line crops.
-    Generates full single lines (type1, type1b) and split lines (type1a top & bottom).
+    Combined real road dataset + multi-font domain-randomized synthetic generator.
     """
-    def __init__(self, size: int = 10000, is_val: bool = False):
+    def __init__(self, size: int = 10000, is_val: bool = False, dataset_dir: str = "dataset"):
         self.size = size
         self.is_val = is_val
+        self.real_crops: List[Tuple[np.ndarray, str]] = []
+
+        # Load real crops from meta.csv
+        meta_path = os.path.join(dataset_dir, "meta.csv")
+        if os.path.exists(meta_path):
+            try:
+                df = pd.read_csv(meta_path, sep=';')
+                real_df = df[(df['is_synthetic'] == 0) & (~df['plate_num'].str.contains('#')) & (df['plate_type'].isin(['type1', 'type1a', 'type1b']))]
+                print(f"Loading {len(real_df)} real plates for OCR training/validation...")
+                for idx, row in real_df.iterrows():
+                    img_path = os.path.join(dataset_dir, row['image'])
+                    if not os.path.exists(img_path):
+                        continue
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+                    bbox = tuple(map(int, row['bbox'].split(',')))
+                    quad = list(map(float, row['quad'].split(','))) if pd.notna(row['quad']) else None
+                    ptype = row['plate_type']
+                    pnum = row['plate_num']
+
+                    rect = rectify_plate(img, bbox, quad, ptype)
+                    if rect.size == 0:
+                        continue
+
+                    if ptype == 'type1a' and len(pnum) >= 8:
+                        top, bot = split_type1a_lines(rect)
+                        self.real_crops.append((top, pnum[:4]))
+                        self.real_crops.append((bot, pnum[4:]))
+                    else:
+                        resized = cv2.resize(rect, (256, 48), interpolation=cv2.INTER_LINEAR)
+                        self.real_crops.append((resized, pnum))
+                print(f"Successfully cached {len(self.real_crops)} real line crops.")
+            except Exception as e:
+                print(f"Warning: Failed to load real crops: {e}")
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        # Sample mode: 40% full single line, 30% type1a top (L DDD), 30% type1a bottom (LL RRR)
-        mode = random.choices(['full', 'type1a_top', 'type1a_bot'], weights=[0.4, 0.3, 0.3])[0]
+        # 45% real crop (if available), 55% multi-font synthetic
+        use_real = (len(self.real_crops) > 0) and (random.random() < 0.45)
 
-        if mode == 'full':
-            ptype = 'type1' if random.random() > 0.3 else 'type1b'
-            plate_img, text, _ = generate_plate_image(ptype)
-            crop_bgr = cv2.cvtColor(np.array(plate_img), cv2.COLOR_RGB2BGR)
-        elif mode == 'type1a_top':
-            l1 = random.choice(LETTERS)
-            d3 = "".join(random.choices(DIGITS, k=3))
-            text = f"{l1}{d3}"
-            plate_img, full_text, _ = generate_plate_image('type1a', plate_num=f"{text}AA77")
-            crop_bgr = cv2.cvtColor(np.array(plate_img), cv2.COLOR_RGB2BGR)
-            top_line, _ = split_type1a_lines(crop_bgr)
-            crop_bgr = top_line
-        else:  # type1a_bot
-            l2 = "".join(random.choices(LETTERS, k=2))
-            reg = random.choice(ALL_REGIONS)
-            text = f"{l2}{reg}"
-            plate_img, full_text, _ = generate_plate_image('type1a', plate_num=f"A123{text}")
-            crop_bgr = cv2.cvtColor(np.array(plate_img), cv2.COLOR_RGB2BGR)
-            _, bot_line = split_type1a_lines(crop_bgr)
-            crop_bgr = bot_line
+        if use_real:
+            crop_bgr, text = random.choice(self.real_crops)
+            crop_bgr = crop_bgr.copy()
+        else:
+            mode = random.choices(
+                ['full_type1', 'full_type1b', 'type1a_top', 'type1a_bot'],
+                weights=[0.30, 0.20, 0.25, 0.25]
+            )[0]
+            crop_bgr, text = generate_synthetic_line(mode)
 
-        # Resize to standard OCR input: 256x48
-        resized = cv2.resize(crop_bgr, (256, 48), interpolation=cv2.INTER_LINEAR)
+        # Target dimensions: 256 x 48
+        if crop_bgr.shape[0] != 48 or crop_bgr.shape[1] != 256:
+            crop_bgr = cv2.resize(crop_bgr, (256, 48), interpolation=cv2.INTER_LINEAR)
 
-        # Photometric augmentations if training
+        # Photometric & geometric augmentations
         if not self.is_val:
-            # Random brightness & contrast
-            alpha = random.uniform(0.7, 1.3)
+            # Random brightness and contrast
+            alpha = random.uniform(0.75, 1.25)
             beta = random.randint(-25, 25)
-            resized = np.clip(resized.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+            crop_bgr = np.clip(crop_bgr.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
 
-            # Random slight blur
-            if random.random() < 0.25:
-                ksize = random.choice([3, 5])
-                resized = cv2.GaussianBlur(resized, (ksize, ksize), 0)
+            # Random slight Gaussian blur
+            if random.random() < 0.30:
+                k = random.choice([3, 5])
+                crop_bgr = cv2.GaussianBlur(crop_bgr, (k, k), 0)
 
             # Random noise
             if random.random() < 0.25:
-                noise = np.random.normal(0, 10, resized.shape).astype(np.float32)
-                resized = np.clip(resized.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                noise = np.random.normal(0, random.uniform(5, 15), crop_bgr.shape).astype(np.float32)
+                crop_bgr = np.clip(crop_bgr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+            # Random morphological erosion or dilation
+            if random.random() < 0.20:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+                if random.random() < 0.5:
+                    crop_bgr = cv2.erode(crop_bgr, kernel, iterations=1)
+                else:
+                    crop_bgr = cv2.dilate(crop_bgr, kernel, iterations=1)
 
         # Normalize (ImageNet stats)
-        img_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        img_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         norm = (img_rgb - mean) / std
@@ -122,7 +247,7 @@ def train_ocr(
     print("=" * 60)
 
     train_dataset = LicensePlateOCRDataset(size=8000, is_val=False)
-    val_dataset = LicensePlateOCRDataset(size=1000, is_val=True)
+    val_dataset = LicensePlateOCRDataset(size=1200, is_val=True)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
@@ -132,7 +257,7 @@ def train_ocr(
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    best_val_loss = float('inf')
+    best_acc = 0.0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -201,13 +326,13 @@ def train_ocr(
 
         print(f"Epoch {epoch:2d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Seq Acc: {accuracy:.2f}%")
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if accuracy > best_acc or epoch == epochs:
+            best_acc = accuracy
             os.makedirs(os.path.dirname(output_weights), exist_ok=True)
             torch.save(model.state_dict(), output_weights)
             print(f"  -> Saved new best OCR model to {output_weights} (Acc: {accuracy:.2f}%)")
 
-    print("\nOCR Training Completed!")
+    print(f"\nOCR Training Completed! Best Accuracy: {best_acc:.2f}%")
 
 
 if __name__ == '__main__':

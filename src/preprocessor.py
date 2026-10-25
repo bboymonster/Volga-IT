@@ -98,9 +98,17 @@ def split_type1a_lines(plate_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     Split square 2-line plate (Type 1A) into:
     - Top line: 1 letter + 3 digits
     - Bottom line: 2 letters + 2-3 digits region
+    Uses adaptive horizontal projection profile to find the exact gap between rows.
     """
     h, w = plate_bgr.shape[:2]
-    split_y = int(h * 0.52)
+    if h < 20 or w < 20:
+        split_y = int(h * 0.50)
+    else:
+        gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+        inv = 255 - gray
+        proj = inv.mean(axis=1)
+        y_start, y_end = int(h * 0.38), int(h * 0.62)
+        split_y = y_start + int(np.argmin(proj[y_start:y_end]))
 
     top_crop = plate_bgr[0:split_y, :]
     bot_crop = plate_bgr[split_y:h, :]
@@ -110,3 +118,4 @@ def split_type1a_lines(plate_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     bot_resized = cv2.resize(bot_crop, (256, 48), interpolation=cv2.INTER_LINEAR)
 
     return top_resized, bot_resized
+

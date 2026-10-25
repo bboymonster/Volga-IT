@@ -55,3 +55,5 @@ ultralytics==8.4.188
 ultralytics-platform==0.1.94
 ultralytics-thop==2.2.3
 urllib3==2.8.0
+reportlab>=4.0.0
+
